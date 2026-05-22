@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import time
 from datetime import datetime
 from functools import wraps
 from flask import (
@@ -9,9 +10,14 @@ from flask import (
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24).hex())
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-in-production')
 
 DATABASE = os.path.join(os.path.dirname(__file__), 'todo.db')
+
+VALID_PRIORITIES = {'low', 'medium', 'high'}
+
+_login_attempts = {}
+
 
 
 # ============================================================
@@ -53,6 +59,7 @@ def init_db():
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id);
     ''')
     admin_pw = os.environ.get('ADMIN_PASSWORD', 'admin123')
     cur = db.execute('SELECT id FROM users WHERE username = ?', ('admin',))
@@ -91,6 +98,29 @@ def admin_required(f):
             return redirect(url_for('index'))
         return f(*args, **kwargs)
     return wrapper
+
+
+# ============================================================
+#  Rate limiter & error handler
+# ============================================================
+
+def _check_rate_limit(ip, max_attempts=5, window=60):
+    now = time.time()
+    attempts = _login_attempts.get(ip, [])
+    attempts = [t for t in attempts if now - t < window]
+    _login_attempts[ip] = attempts
+    return len(attempts) < max_attempts
+
+
+def _record_attempt(ip):
+    _login_attempts.setdefault(ip, []).append(time.time())
+
+
+@app.errorhandler(sqlite3.Error)
+def handle_db_error(e):
+    app.logger.exception("Database error")
+    flash('操作失败，请稍后重试', 'danger')
+    return redirect(request.referrer or url_for('index'))
 
 
 # ============================================================
@@ -640,6 +670,12 @@ def register():
         if not username or not password:
             flash('用户名和密码不能为空', 'danger')
             return redirect(url_for('register'))
+        if len(username) > 32:
+            flash('用户名不能超过32个字符', 'danger')
+            return redirect(url_for('register'))
+        if len(password) < 6:
+            flash('密码至少需要6个字符', 'danger')
+            return redirect(url_for('register'))
         if password != password2:
             flash('两次密码不一致', 'danger')
             return redirect(url_for('register'))
@@ -660,6 +696,10 @@ def register():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        ip = request.remote_addr
+        if not _check_rate_limit(ip):
+            flash('登录尝试过于频繁，请稍后再试', 'danger')
+            return redirect(url_for('login'))
         username = request.form['username'].strip()
         password = request.form['password']
         db = get_db()
@@ -671,6 +711,7 @@ def login():
             flash('登录成功', 'success')
             return redirect(url_for('index'))
         flash('用户名或密码错误', 'danger')
+        _record_attempt(ip)
         return redirect(url_for('login'))
     return render_template_string(LOGIN_TEMPLATE)
 
@@ -716,8 +757,16 @@ def add_todo():
     title = request.form['title'].strip()
     description = request.form.get('description', '').strip()
     priority = request.form.get('priority', 'medium')
+    if priority not in VALID_PRIORITIES:
+        priority = 'medium'
     if not title:
         flash('任务标题不能为空', 'danger')
+        return redirect(url_for('index'))
+    if len(title) > 200:
+        flash('任务标题不能超过200个字符', 'danger')
+        return redirect(url_for('index'))
+    if len(description) > 2000:
+        flash('描述不能超过2000个字符', 'danger')
         return redirect(url_for('index'))
     now = datetime.now().isoformat()
     db = get_db()
@@ -769,11 +818,16 @@ def edit_todo(todo_id):
     title = request.form.get('title', '').strip()
     description = request.form.get('description', '').strip()
     priority = request.form.get('priority', 'medium')
-    if title:
-        now = datetime.now().isoformat()
-        db.execute('UPDATE todos SET title=?, description=?, priority=?, updated_at=? WHERE id=?',
-                   (title, description, priority, now, todo_id))
-        db.commit()
+    if priority not in VALID_PRIORITIES:
+        priority = 'medium'
+    if not title:
+        return jsonify({'error': '标题不能为空'}), 400
+    if len(title) > 200 or len(description) > 2000:
+        return jsonify({'error': '输入过长'}), 400
+    now = datetime.now().isoformat()
+    db.execute('UPDATE todos SET title=?, description=?, priority=?, updated_at=? WHERE id=?',
+               (title, description, priority, now, todo_id))
+    db.commit()
     return jsonify({'ok': True})
 
 
@@ -849,4 +903,5 @@ with app.app_context():
     init_db()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug = os.environ.get('FLASK_DEBUG', '1') == '1'
+    app.run(host='0.0.0.0', port=5000, debug=debug)
